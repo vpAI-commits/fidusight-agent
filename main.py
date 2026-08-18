@@ -42,21 +42,22 @@ async def ingest_file(file: UploadFile = File(...)):
 
         # 3. Row-by-Row Validation Engine
         for index, row in df.iterrows():
-            claim = row.to_dict()
+            # THE FIX: Convert Pandas NaN to Python None instantly so JSON doesn't crash
+            claim = {k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()}
             error_reasons = []
 
             # Rule A: Check for missing financial data
-            if pd.isna(claim.get('amt_paid_pharmacy')) or str(claim.get('amt_paid_pharmacy')).strip() == '':
+            if claim.get('amt_paid_pharmacy') is None or str(claim.get('amt_paid_pharmacy')).strip() == '':
                 error_reasons.append("Missing Pharmacy Paid Amount")
             
             # Rule B: Validate NDC-11 format
-            ndc = str(claim.get('ndc_11', '')).replace('.0', '').strip()
+            ndc = str(claim.get('ndc_11') or '').replace('.0', '').strip()
             if len(ndc) != 11 or not ndc.isdigit():
                 error_reasons.append(f"Invalid NDC format: {ndc}")
             
             claim['ndc_11'] = ndc # Clean it up for the DB
 
-            # Execute True Net Price Math
+            # Execute True Net Price Math safely treating None as 0
             pharmacy_amt = float(claim.get('amt_paid_pharmacy') or 0)
             rebate = float(claim.get('rebate_passed_thru') or 0)
             claim['true_net_price'] = pharmacy_amt - rebate
@@ -82,27 +83,6 @@ async def ingest_file(file: UploadFile = File(...)):
             "quarantined_rows": len(quarantined_claims),
             "filename": file.filename
         }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-        df.columns = [str(c).strip().lower().replace(' ', '_') for c in df.columns]
-
-        # Ensure the True Net Price column exists (Basic math calculation)
-        if 'amt_paid_pharmacy' in df.columns and 'rebate_passed_thru' in df.columns:
-            df['true_net_price'] = df['amt_paid_pharmacy'] - df['rebate_passed_thru']
-        else:
-            df['true_net_price'] = 0
-
-        # Fill missing values so the database doesn't crash
-        df = df.fillna(0)
-
-        # Convert the dataframe to a list of dictionaries for Supabase
-        records = df.to_dict(orient="records")
-
-        # 4. Push data to Supabase (assuming columns match your 'claims' table)
-        response = supabase.table('claims').insert(records).execute()
-
-        return {"message": "Success", "rows_ingested": len(records), "filename": file.filename}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
