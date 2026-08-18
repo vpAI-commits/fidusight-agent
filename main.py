@@ -15,8 +15,8 @@ app.add_middleware(
 )
 
 # Connect to your Supabase Database
-SUPABASE_URL = "YOUR_SUPABASE_URL_HERE"
-SUPABASE_KEY = "YOUR_SUPABASE_ANON_KEY_HERE"
+SUPABASE_URL = "https://iiomsxmqefxizdrclvxh.supabase.co"
+SUPABASE_KEY = "sb_publishable_gU7PTU3YxS5CmgyvPNyNng_dKeahHum"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 @app.post("/ingest")
