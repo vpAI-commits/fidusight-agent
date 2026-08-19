@@ -14,8 +14,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SUPABASE_URL = "YOUR_SUPABASE_URL_HERE"
-SUPABASE_KEY = "YOUR_SUPABASE_ANON_KEY_HERE"
+SUPABASE_URL = "https://iiomsxmqefxizdrclvxh.supabase.co"
+SUPABASE_KEY = "sb_publishable_gU7PTU3YxS5CmgyvPNyNng_dKeahHum"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # --- ENTERPRISE API ORCHESTRATION ---
