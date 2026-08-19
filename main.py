@@ -2,11 +2,11 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import io
+import requests
 from supabase import create_client, Client
 
 app = FastAPI()
 
-# Allow your Vercel website to talk to this agent
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,55 +14,89 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Connect to your Supabase Database
-SUPABASE_URL = "https://iiomsxmqefxizdrclvxh.supabase.co"
-SUPABASE_KEY = "sb_publishable_gU7PTU3YxS5CmgyvPNyNng_dKeahHum"
+SUPABASE_URL = "YOUR_SUPABASE_URL_HERE"
+SUPABASE_KEY = "YOUR_SUPABASE_ANON_KEY_HERE"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# --- ENTERPRISE API ORCHESTRATION ---
+def fetch_ndc_metadata(ndc: str, drug_name: str, cache: dict):
+    """Hits the RxNorm API to enrich NDC data, with an in-memory cache to prevent throttling."""
+    if ndc in cache:
+        return cache[ndc]
+    
+    # Default baseline metadata
+    meta = {
+        "rxcui": "Unknown", 
+        "brand_vs_generic": "Generic", # Default assumption
+        "therapeutic_class": "Unclassified"
+    }
+    
+    try:
+        # 1. Fetch RxCUI from National Library of Medicine
+        rxcui_resp = requests.get(f"https://rxnav.nlm.nih.gov/REST/rxcui.json?idtype=NDC&id={ndc}", timeout=2)
+        if rxcui_resp.status_code == 200:
+            data = rxcui_resp.json()
+            if "rxnormId" in data.get("idGroup", {}):
+                meta["rxcui"] = data["idGroup"]["rxnormId"][0]
+
+        # 2. Heuristic Classification (Simulating a robust MAC list mapping)
+        name_lower = str(drug_name).lower()
+        if "pen" in name_lower or "ozempic" in name_lower or "humira" in name_lower:
+            meta["brand_vs_generic"] = "Brand"
+            
+        if "ozempic" in name_lower: meta["therapeutic_class"] = "GLP-1 Agonist"
+        elif "humira" in name_lower: meta["therapeutic_class"] = "Autoimmune / Biologic"
+        elif "statin" in name_lower: meta["therapeutic_class"] = "Cardiovascular"
+        elif "pril" in name_lower or "sartan" in name_lower: meta["therapeutic_class"] = "Cardiovascular"
+        elif "cillin" in name_lower: meta["therapeutic_class"] = "Antibiotic"
+        elif "thyroid" in name_lower: meta["therapeutic_class"] = "Endocrine"
+        
+    except requests.exceptions.RequestException:
+        # Fail gracefully if the external API goes down; do not crash the ingestion pipeline
+        pass 
+        
+    cache[ndc] = meta
+    return meta
 
 @app.post("/ingest")
 async def ingest_file(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         
-        # 1. Auto-detect file type
-        if file.filename.endswith('.csv'):
-            df = pd.read_csv(io.BytesIO(contents))
-        elif file.filename.endswith('.xlsx'):
-            df = pd.read_excel(io.BytesIO(contents))
-        elif file.filename.endswith('.json'):
-            df = pd.read_json(io.BytesIO(contents))
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported format.")
+        if file.filename.endswith('.csv'): df = pd.read_csv(io.BytesIO(contents))
+        elif file.filename.endswith('.xlsx'): df = pd.read_excel(io.BytesIO(contents))
+        elif file.filename.endswith('.json'): df = pd.read_json(io.BytesIO(contents))
+        else: raise HTTPException(status_code=400, detail="Unsupported format.")
 
-        # 2. Standardize column names
         df.columns = [str(c).strip().lower().replace(' ', '_') for c in df.columns]
 
         valid_claims = []
         quarantined_claims = []
+        ndc_memory_cache = {} # Initializes the caching layer for this file
 
-        # 3. Row-by-Row Validation Engine
         for index, row in df.iterrows():
-            # THE FIX: Convert Pandas NaN to Python None instantly so JSON doesn't crash
             claim = {k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()}
             error_reasons = []
 
-            # Rule A: Check for missing financial data
             if claim.get('amt_paid_pharmacy') is None or str(claim.get('amt_paid_pharmacy')).strip() == '':
                 error_reasons.append("Missing Pharmacy Paid Amount")
             
-            # Rule B: Validate NDC-11 format
             ndc = str(claim.get('ndc_11') or '').replace('.0', '').strip()
             if len(ndc) != 11 or not ndc.isdigit():
                 error_reasons.append(f"Invalid NDC format: {ndc}")
             
-            claim['ndc_11'] = ndc # Clean it up for the DB
+            claim['ndc_11'] = ndc
+            
+            # --- TRIGGER REAL-TIME ENRICHMENT ---
+            metadata = fetch_ndc_metadata(ndc, claim.get('drug_name', ''), ndc_memory_cache)
+            claim['rxcui'] = metadata['rxcui']
+            claim['brand_vs_generic'] = metadata['brand_vs_generic']
+            claim['therapeutic_class'] = metadata['therapeutic_class']
 
-            # Execute True Net Price Math safely treating None as 0
             pharmacy_amt = float(claim.get('amt_paid_pharmacy') or 0)
             rebate = float(claim.get('rebate_passed_thru') or 0)
             claim['true_net_price'] = pharmacy_amt - rebate
 
-            # 4. Route the data
             if error_reasons:
                 claim['error_reason'] = " | ".join(error_reasons)
                 claim['status'] = 'NEEDS_REVIEW'
@@ -70,10 +104,8 @@ async def ingest_file(file: UploadFile = File(...)):
             else:
                 valid_claims.append(claim)
 
-        # 5. Push to Supabase safely
         if valid_claims:
             supabase.table('claims').insert(valid_claims).execute()
-        
         if quarantined_claims:
             supabase.table('quarantined_claims').insert(quarantined_claims).execute()
 
