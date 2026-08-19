@@ -4,3 +4,4 @@ pandas
 supabase
 python-multipart
 openpyxl
+requests
