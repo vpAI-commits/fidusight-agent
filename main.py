@@ -18,13 +18,10 @@ SUPABASE_URL = "https://iiomsxmqefxizdrclvxh.supabase.co"
 SUPABASE_KEY = "sb_publishable_gU7PTU3YxS5CmgyvPNyNng_dKeahHum"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- ENTERPRISE API ORCHESTRATION ---
 def fetch_ndc_metadata(ndc: str, drug_name: str, cache: dict):
-    """Hits the RxNorm API to enrich NDC data, with an in-memory cache to prevent throttling."""
     if ndc in cache:
         return cache[ndc]
         
-    # Default baseline metadata
     meta = {
         "rxcui": "Unknown", 
         "brand_vs_generic": "Generic", 
@@ -32,13 +29,12 @@ def fetch_ndc_metadata(ndc: str, drug_name: str, cache: dict):
     }
     
     try:
-        # 1. Fetch RxCUI from National Library of Medicine
         rxcui_resp = requests.get(f"https://rxnav.nlm.nih.gov/REST/rxcui.json?idtype=NDC&id={ndc}", timeout=2)
         if rxcui_resp.status_code == 200:
             data = rxcui_resp.json()
             if "rxnormId" in data.get("idGroup", {}):
                 meta["rxcui"] = data["idGroup"]["rxnormId"][0]
-        # 2. Heuristic Classification
+                
         name_lower = str(drug_name).lower()
         if "pen" in name_lower or "ozempic" in name_lower or "humira" in name_lower:
             meta["brand_vs_generic"] = "Brand"
@@ -49,7 +45,6 @@ def fetch_ndc_metadata(ndc: str, drug_name: str, cache: dict):
         elif "pril" in name_lower or "sartan" in name_lower: meta["therapeutic_class"] = "Cardiovascular"
         elif "cillin" in name_lower: meta["therapeutic_class"] = "Antibiotic"
         elif "thyroid" in name_lower: meta["therapeutic_class"] = "Endocrine"
-            
     except requests.exceptions.RequestException:
         pass
         
@@ -75,7 +70,12 @@ async def ingest_file(file: UploadFile = File(...)):
             claim = {k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()}
             error_reasons = []
             
-            # Check pharmacy paid amount presence
+            # Capture Plan Identifier (defaults to vendor code + '_COMM' if missing)
+            pbm_vendor = str(claim.get('pbm_vendor_id') or 'CVS').upper()
+            plan_code = str(claim.get('pbm_plan_id') or claim.get('plan_code') or f"{pbm_vendor}_COMM").upper()
+            claim['pbm_plan_id'] = plan_code
+            claim['pbm_vendor_id'] = pbm_vendor
+
             raw_pharmacy_amt = claim.get('amt_paid_pharmacy')
             if raw_pharmacy_amt is None or str(raw_pharmacy_amt).strip() == '':
                 error_reasons.append("Missing Pharmacy Paid Amount")
@@ -86,13 +86,13 @@ async def ingest_file(file: UploadFile = File(...)):
                 
             claim['ndc_11'] = ndc
             
-            # --- TRIGGER REAL-TIME ENRICHMENT ---
+            # Enrichment
             metadata = fetch_ndc_metadata(ndc, claim.get('drug_name', ''), ndc_memory_cache)
             claim['rxcui'] = metadata['rxcui']
             claim['brand_vs_generic'] = metadata['brand_vs_generic']
             claim['therapeutic_class'] = metadata['therapeutic_class']
             
-            # Safe casting for pharmacy paid amount & sanitizing the dictionary for Supabase
+            # Safe casting
             try:
                 pharmacy_amt = float(raw_pharmacy_amt) if raw_pharmacy_amt is not None and str(raw_pharmacy_amt).strip() != '' else 0.0
                 claim['amt_paid_pharmacy'] = pharmacy_amt
@@ -101,7 +101,6 @@ async def ingest_file(file: UploadFile = File(...)):
                 error_reasons.append(f"Invalid Pharmacy Paid Amount: {raw_pharmacy_amt}")
                 pharmacy_amt = 0.0
                 
-            # Safe casting for rebate amount & sanitizing the dictionary for Supabase
             raw_rebate = claim.get('rebate_passed_thru')
             try:
                 rebate = float(raw_rebate) if raw_rebate is not None and str(raw_rebate).strip() != '' else 0.0
@@ -126,7 +125,7 @@ async def ingest_file(file: UploadFile = File(...)):
             supabase.table('quarantined_claims').insert(quarantined_claims).execute()
             
         return {
-            "message": "Processing Complete", 
+            "message": "Processing Complete with Plan Granularity", 
             "valid_rows_ingested": len(valid_claims), 
             "quarantined_rows": len(quarantined_claims),
             "filename": file.filename
