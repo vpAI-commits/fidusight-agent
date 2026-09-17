@@ -27,7 +27,7 @@ def fetch_ndc_metadata(ndc: str, drug_name: str, cache: dict):
     # Default baseline metadata
     meta = {
         "rxcui": "Unknown", 
-        "brand_vs_generic": "Generic", # Default assumption
+        "brand_vs_generic": "Generic", 
         "therapeutic_class": "Unclassified"
     }
     
@@ -38,7 +38,7 @@ def fetch_ndc_metadata(ndc: str, drug_name: str, cache: dict):
             data = rxcui_resp.json()
             if "rxnormId" in data.get("idGroup", {}):
                 meta["rxcui"] = data["idGroup"]["rxnormId"][0]
-        # 2. Heuristic Classification (Simulating a robust MAC list mapping)
+        # 2. Heuristic Classification
         name_lower = str(drug_name).lower()
         if "pen" in name_lower or "ozempic" in name_lower or "humira" in name_lower:
             meta["brand_vs_generic"] = "Brand"
@@ -51,7 +51,6 @@ def fetch_ndc_metadata(ndc: str, drug_name: str, cache: dict):
         elif "thyroid" in name_lower: meta["therapeutic_class"] = "Endocrine"
             
     except requests.exceptions.RequestException:
-        # Fail gracefully if the external API goes down; do not crash the ingestion pipeline
         pass
         
     cache[ndc] = meta
@@ -70,14 +69,15 @@ async def ingest_file(file: UploadFile = File(...)):
         df.columns = [str(c).strip().lower().replace(' ', '_') for c in df.columns]
         valid_claims = []
         quarantined_claims = []
-        ndc_memory_cache = {} # Initializes the caching layer for this file
+        ndc_memory_cache = {}
         
         for index, row in df.iterrows():
             claim = {k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()}
             error_reasons = []
             
             # Check pharmacy paid amount presence
-            if claim.get('amt_paid_pharmacy') is None or str(claim.get('amt_paid_pharmacy')).strip() == '':
+            raw_pharmacy_amt = claim.get('amt_paid_pharmacy')
+            if raw_pharmacy_amt is None or str(raw_pharmacy_amt).strip() == '':
                 error_reasons.append("Missing Pharmacy Paid Amount")
                 
             ndc = str(claim.get('ndc_11') or '').replace('.0', '').strip()
@@ -92,19 +92,24 @@ async def ingest_file(file: UploadFile = File(...)):
             claim['brand_vs_generic'] = metadata['brand_vs_generic']
             claim['therapeutic_class'] = metadata['therapeutic_class']
             
-            # Safe casting for pharmacy paid amount to prevent string-to-float crashes
+            # Safe casting for pharmacy paid amount & sanitizing the dictionary for Supabase
             try:
-                pharmacy_amt = float(claim.get('amt_paid_pharmacy') or 0)
+                pharmacy_amt = float(raw_pharmacy_amt) if raw_pharmacy_amt is not None and str(raw_pharmacy_amt).strip() != '' else 0.0
+                claim['amt_paid_pharmacy'] = pharmacy_amt
             except (ValueError, TypeError):
+                claim['amt_paid_pharmacy'] = None
+                error_reasons.append(f"Invalid Pharmacy Paid Amount: {raw_pharmacy_amt}")
                 pharmacy_amt = 0.0
-                error_reasons.append(f"Invalid Pharmacy Paid Amount: {claim.get('amt_paid_pharmacy')}")
                 
-            # Safe casting for rebate amount
+            # Safe casting for rebate amount & sanitizing the dictionary for Supabase
+            raw_rebate = claim.get('rebate_passed_thru')
             try:
-                rebate = float(claim.get('rebate_passed_thru') or 0)
+                rebate = float(raw_rebate) if raw_rebate is not None and str(raw_rebate).strip() != '' else 0.0
+                claim['rebate_passed_thru'] = rebate
             except (ValueError, TypeError):
+                claim['rebate_passed_thru'] = None
+                error_reasons.append(f"Invalid Rebate Amount: {raw_rebate}")
                 rebate = 0.0
-                error_reasons.append(f"Invalid Rebate Amount: {claim.get('rebate_passed_thru')}")
                 
             claim['true_net_price'] = pharmacy_amt - rebate
             
