@@ -81,7 +81,6 @@ async def ingest_file(file: UploadFile = File(...)):
             claim = {k: (None if pd.isna(v) else v) for k, v in row.to_dict().items()}
             error_reasons = []
 
-            # 1. Identity & Plan Details
             pbm_vendor = str(claim.get('pbm_vendor_id') or 'CVS').upper()
             plan_code = str(claim.get('pbm_plan_id') or claim.get('plan_code') or f"{pbm_vendor}_COMM").upper()
             claim_ref = str(claim.get('claim_ref') or f"CLM-{now_dt.strftime('%Y%m')}-{idx+1001:04d}")
@@ -89,19 +88,16 @@ async def ingest_file(file: UploadFile = File(...)):
             claim['pbm_vendor_id'] = pbm_vendor
             claim['pbm_plan_id'] = plan_code
 
-            # 2. NDC Validation
             ndc = str(claim.get('ndc_11') or '').replace('.0', '').strip()
             if len(ndc) != 11 or not ndc.isdigit():
                 error_reasons.append(f"Invalid NDC format: {ndc}")
             claim['ndc_11'] = ndc
 
-            # 3. RxNorm Enrichment
             metadata = fetch_ndc_metadata(ndc, claim.get('drug_name', ''), ndc_memory_cache)
             claim['rxcui'] = metadata['rxcui']
             claim['brand_vs_generic'] = metadata['brand_vs_generic']
             claim['therapeutic_class'] = metadata['therapeutic_class']
 
-            # 4. Safe Numerical Conversions for Full Economic Waterfall
             wac_price, _ = safe_float(claim.get('wac_unit_price'))
             awp_price, _ = safe_float(claim.get('awp_unit_price'))
             nadac_price, _ = safe_float(claim.get('nadac_unit_price'))
@@ -113,12 +109,10 @@ async def ingest_file(file: UploadFile = File(...)):
             member_copay, _ = safe_float(claim.get('member_copay_paid'))
             billed_plan, ok3 = safe_float(claim.get('amt_billed_plan'))
 
-            # Pharmacy Paid Amount = Ingredient Cost + Dispensing Fee
             pharmacy_amt, ok4 = safe_float(claim.get('amt_paid_pharmacy'))
             if not ok4:
                 pharmacy_amt = ing_paid + disp_fee
 
-            # Rebate Waterfall
             mfg_rebate, _ = safe_float(claim.get('mfg_rebate_total'))
             retained_rebate, _ = safe_float(claim.get('pbm_retained_rebate'))
             passed_rebate, ok5 = safe_float(claim.get('rebate_passed_thru'))
@@ -127,13 +121,11 @@ async def ingest_file(file: UploadFile = File(...)):
 
             bfsf_fee, _ = safe_float(claim.get('bfsf_admin_fee'), 3.50)
 
-            # True Spread Amount
             if billed_plan > 0 and pharmacy_amt > 0:
                 spread = max(0.0, billed_plan - pharmacy_amt)
             else:
                 spread, _ = safe_float(claim.get('spread_amount'), 0.0)
 
-            # Sanitized Assignments
             claim['awp_unit_price'] = awp_price
             claim['wac_unit_price'] = wac_price
             claim['nadac_unit_price'] = nadac_price
@@ -150,54 +142,48 @@ async def ingest_file(file: UploadFile = File(...)):
             claim['rebate_passed_thru'] = passed_rebate
             claim['bfsf_admin_fee'] = bfsf_fee
 
-            # Standard True Net Price (TNP)
             tnp = (pharmacy_amt + bfsf_fee) - passed_rebate
             claim['true_net_price'] = max(0.0, tnp)
 
-            # Validation checks
             if not ok1 and not ok4:
                 error_reasons.append("Missing Pharmacy Reimbursement / Ingredient Cost")
             if claim.get('amt_paid_pharmacy') is None:
                 error_reasons.append("Invalid or Missing Pharmacy Paid Amount")
 
-            # --- CAA 2026 STATUTORY AUDIT ENGINE ---
             if not error_reasons:
-                # Violation Rule 1: Prohibited Spread Pricing
                 if spread > 1.00:
                     audit_anomalies.append({
                         "claim_ref": claim_ref,
                         "pbm_plan_id": plan_code,
                         "anomaly_type": "VIOLATION_SPREAD_PRICING",
                         "severity": "CRITICAL_ERISA_BREACH",
-                        "description": f"PBM retained ${spread:.2f} spread margin on claim ({pbm_vendor} billed ${claim['amt_billed_plan']:.2f}, pharmacy received ${pharmacy_amt:.2f}). Violates pass-through statutory mandate.",
+                        "description": "Violation: PBM retained unauthorized spread margin on the claim. Next Step: Issue Statutory Cure Notice to recover disallowed spread.",
                         "dollar_amount": spread,
                         "status": "OPEN",
                         "legal_statute": "ERISA §408(b)(2) / CAA 2026 Pass-Through Standard",
                         "statutory_deadline": statutory_deadline
                     })
 
-                # Violation Rule 2: Unremitted Rebate Leakage (GPO / Aggregator Retention)
                 if retained_rebate > 5.00:
                     audit_anomalies.append({
                         "claim_ref": claim_ref,
                         "pbm_plan_id": plan_code,
                         "anomaly_type": "AGGREGATOR_LEAKAGE_AUDIT",
                         "severity": "HIGH",
-                        "description": f"PBM/GPO retained ${retained_rebate:.2f} of ${mfg_rebate:.2f} manufacturer rebate. CAA 2026 mandates 100% pass-through of all direct and indirect manufacturer remuneration.",
+                        "description": "Violation: Manufacturer rebate was partially retained by PBM/GPO aggregator. Next Step: Demand 100% pass-through remittance per CAA 2026 mandates.",
                         "dollar_amount": retained_rebate,
                         "status": "OPEN",
                         "legal_statute": "CAA 2026 §201 Direct Remittance Rule",
                         "statutory_deadline": statutory_deadline
                     })
 
-                # Violation Rule 3: Inflated BFSF Admin Fee
                 if bfsf_fee > 15.00:
                     audit_anomalies.append({
                         "claim_ref": claim_ref,
                         "pbm_plan_id": plan_code,
                         "anomaly_type": "NON_FMV_ADMIN_FEE",
                         "severity": "MEDIUM",
-                        "description": f"Bona Fide Service Fee (${bfsf_fee:.2f}) exceeds fair market value safe harbor threshold ($5.00-$10.00/claim).",
+                        "description": "Violation: Bona Fide Service Fee exceeds fair market value safe harbor threshold. Next Step: Audit administrative service agreements for percentage-based kickbacks.",
                         "dollar_amount": bfsf_fee - 5.00,
                         "status": "OPEN",
                         "legal_statute": "ERISA Reasonable Compensation Test",
@@ -211,7 +197,6 @@ async def ingest_file(file: UploadFile = File(...)):
             else:
                 valid_claims.append(claim)
 
-        # Batch Operations to Supabase
         if valid_claims:
             supabase.table('claims').insert(valid_claims).execute()
         if quarantined_claims:
@@ -219,7 +204,6 @@ async def ingest_file(file: UploadFile = File(...)):
         if audit_anomalies:
             supabase.table('audit_anomalies').insert(audit_anomalies).execute()
 
-            # Record tamper-evident SHA-256 ledger entry for fiduciary safe harbor
             summary_str = f"{file.filename}:{len(audit_anomalies)}:{now_dt.isoformat()}"
             audit_hash = hashlib.sha256(summary_str.encode()).hexdigest()
             supabase.table('audit_log').insert([{
